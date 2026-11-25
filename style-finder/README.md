@@ -45,3 +45,13 @@ Claude's web search costs about $10 per 1,000 searches plus tokens, and each sea
 ## Not built yet
 
 Size filter, target prices, landed cost, image embeddings, Instagram links (send a screenshot instead).
+
+## Run it all the time on Railway
+
+`railway.json` sets the start command, keeps one copy running, and restarts it if it crashes.
+
+1. railway.com → **New Project** → **Deploy from GitHub repo** → pick `vaughan-family-app`.
+2. Open the service → **Settings**: set **Root Directory** to `/style-finder`, and set the branch to deploy.
+3. **Variables**: add `TELEGRAM_TOKEN`, `ANTHROPIC_API_KEY`, `ALLOWED_CHAT_IDS`, and `STYLE_FINDER_DB=/data/finder.db`.
+4. Right-click the service on the canvas → **Attach volume** → mount path `/data`. This keeps your wishlist and seen list across redeploys.
+5. Deploy. Only one copy of the bot can poll Telegram at a time, so stop any other copy first.

@@ -5,6 +5,8 @@ import sqlite3
 import threading
 
 DB_PATH = os.environ.get("STYLE_FINDER_DB", "finder.db")
+if os.path.dirname(DB_PATH):
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)  # e.g. a Railway volume at /data
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 _lock = threading.Lock()  # searches run in worker threads
 
