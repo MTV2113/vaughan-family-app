@@ -111,26 +111,42 @@ def parse_price(v):
         return None
 
 
+IN_STOCK = {"instock", "limitedavailability", "onlineonly", "instoreonly", "preorder",
+            "presale", "backorder", "in stock"}
+OUT_OF_STOCK = {"outofstock", "soldout", "discontinued", "oos", "out of stock", "sold out"}
+
+
+def _stock(values):
+    """True if any value says in stock, False if all known values say out, else None."""
+    vals = {str(v).rsplit("/", 1)[-1].strip().lower() for v in values if v}
+    if vals & IN_STOCK:
+        return True
+    if vals & OUT_OF_STOCK:
+        return False
+    return None
+
+
 def _shopify(url, client):
-    """Any Shopify store answers /products/<handle>.json with full product data."""
+    """Any Shopify store answers /products/<handle>.js with product data and stock."""
     p = urlparse(url)
     if "/products/" not in p.path:
         return None
-    path = p.path.rstrip("/")
-    if not path.endswith(".json"):
-        path += ".json"
+    base = p.path.rstrip("/").removesuffix(".json").removesuffix(".js")
     try:
-        r = client.get(urlunparse(p._replace(path=path, query="", fragment="")))
-        prod = r.json()["product"]
+        r = client.get(urlunparse(p._replace(path=base + ".js", query="", fragment="")))
+        prod = r.json()
+        variants = prod["variants"]
     except Exception:
         return None
-    variants = prod.get("variants") or []
-    sizes = [v.get("title") for v in variants if v.get("available", True)]
-    img = (prod.get("image") or {}).get("src")
+    sizes = [v.get("title") for v in variants if v.get("available")]
+    price = prod.get("price")
+    img = prod.get("featured_image")
     return {"title": prod.get("title"), "brand": prod.get("vendor"),
-            "price": variants[0].get("price") if variants else None,
-            "currency": None, "image": img, "sku": variants[0].get("sku") if variants else None,
-            "sizes": sizes, "condition": None}
+            "price": price / 100 if isinstance(price, (int, float)) else None,  # cents
+            "currency": None, "image": ("https:" + img) if img and img.startswith("//") else img,
+            "sku": variants[0].get("sku") if variants else None,
+            "sizes": sizes, "condition": None,
+            "in_stock": bool(prod.get("available")) and bool(sizes)}
 
 
 def _jsonld_nodes(data):
@@ -153,18 +169,22 @@ def _is_product(node):
     return any(x in ("Product", "ProductGroup", "IndividualProduct") for x in t)
 
 
+def _offers(node):
+    offers = node.get("offers") or {}
+    return [o for o in (offers if isinstance(offers, list) else [offers]) if isinstance(o, dict)]
+
+
 def _jsonld(soup):
+    nodes = []
     for tag in soup.find_all("script", type="application/ld+json"):
         try:
-            data = json.loads(tag.string or "")
+            nodes += [n for n in _jsonld_nodes(json.loads(tag.string or "")) if _is_product(n)]
         except Exception:
             continue
-        for node in _jsonld_nodes(data):
-            if not _is_product(node):
-                continue
-            offers = node.get("offers") or {}
-            offers = offers if isinstance(offers, list) else [offers]
-            offer = next((o for o in offers if isinstance(o, dict)), {})
+    # stock across every product/variant offer on the page
+    in_stock = _stock(o.get("availability") for n in nodes for o in _offers(n))
+    for node in nodes:
+            offer = next(iter(_offers(node)), {})
             price = offer.get("price") or offer.get("lowPrice")
             if price is None and isinstance(offer.get("priceSpecification"), dict):
                 price = offer["priceSpecification"].get("price")
@@ -178,8 +198,7 @@ def _jsonld(soup):
             return {"title": node.get("name"), "brand": brand, "price": price,
                     "currency": offer.get("priceCurrency"), "image": img,
                     "sku": node.get("sku") or node.get("mpn"),
-                    "availability": str(offer.get("availability") or "").rsplit("/", 1)[-1] or None,
-                    "condition": cond}
+                    "in_stock": in_stock, "condition": cond}
     return None
 
 
@@ -194,9 +213,10 @@ PAGE_SCHEMA = {
         "sku": {"type": ["string", "null"]},
         "condition": {"type": ["string", "null"]},
         "sizes": {"type": "array", "items": {"type": "string"}},
+        "in_stock": {"type": ["boolean", "null"]},
     },
     "required": ["is_single_product", "title", "brand", "price", "currency",
-                 "sku", "condition", "sizes"],
+                 "sku", "condition", "sizes", "in_stock"],
     "additionalProperties": False,
 }
 
@@ -207,7 +227,9 @@ def _llm_page(soup):
         return None
     d = ask_json("Does this web page sell one specific product (a product listing, not a "
                  "category, search or editorial page)? If so extract its fields; condition is "
-                 "new, used, or deadstock if stated; sizes are only sizes shown in stock.\n\n"
+                 "new, used, or deadstock if stated; sizes are only sizes shown in stock. in_stock is "
+                 "false if the item is sold out, out of stock, or only offers a restock "
+                 "notification in every size; true if it can be bought now; null if unclear.\n\n"
                  + text, PAGE_SCHEMA, max_tokens=2000)
     if not d.pop("is_single_product") or not d.get("title"):
         return None
@@ -226,6 +248,10 @@ def extract_product(url):
                     return None
                 soup = BeautifulSoup(r.text, "html.parser")
                 p = _jsonld(soup) or _llm_page(soup)
+                if p and p.get("in_stock") is None:
+                    meta = soup.find("meta", property="product:availability") or \
+                        soup.find("meta", property="og:availability")
+                    p["in_stock"] = _stock([meta.get("content")]) if meta else None
     except (httpx.HTTPError, LLMError, ValueError):
         return None
     if not p or not p.get("title"):
@@ -303,8 +329,8 @@ def _tier_ok(card, product):
 
 def _process(item_id, card, strictness, url):
     p = extract_product(url)
-    if not p:
-        return None
+    if not p or p.get("in_stock") is False:
+        return None  # not marked seen: if it comes back in stock it shows up as new
     status = seen_status(item_id, url, p["price"])
     if status is None:
         return None
