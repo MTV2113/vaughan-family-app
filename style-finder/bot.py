@@ -31,6 +31,9 @@ EXTRACT_PROMPT = """You are helping someone find a fashion product online.
 From the image and/or text, fill in the product card. Read any visible text (captions,
 tags, labels, style codes) in the image. aliases are other names the product is sold or
 searched under. style_code is a manufacturer style code or SKU if one is visible.
+retail_price is the full-price retail (not sale) price: use the price shown if one is
+visible, otherwise the typical full retail price of this model if you know it with
+confidence, else null. retail_currency is its ISO code, e.g. USD or EUR.
 Use null for anything you cannot determine, and price_tier "unknown" if unclear.
 Do not guess brands you cannot see or confidently infer from the design."""
 
@@ -56,7 +59,8 @@ def apply_correction(card, text):
 LABELS = [("brand", "Brand"), ("product_name", "Product"), ("aliases", "Aliases"),
           ("style_code", "Style code"), ("category", "Category"),
           ("silhouette", "Silhouette"), ("color", "Color"), ("material", "Material"),
-          ("season", "Season"), ("price_tier", "Price tier"), ("notes", "Notes")]
+          ("season", "Season"), ("price_tier", "Price tier"), ("retail_price", "Retail"),
+          ("notes", "Notes")]
 
 
 def format_card(card):
@@ -65,6 +69,8 @@ def format_card(card):
         v = card.get(key)
         if isinstance(v, list):
             v = ", ".join(v)
+        if key == "retail_price" and v:
+            v = f"{v:,.0f} {card.get('retail_currency') or ''}".strip()
         if v and v != "unknown":
             lines.append(f"{name}: {v}")
     return "\n".join(lines) or "(nothing recognised yet)"

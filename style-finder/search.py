@@ -352,17 +352,57 @@ def _process(item_id, card, strictness, url):
     return {**p, "label": label, "reason": reason, "status": status}
 
 
+# Rough USD value of one unit, for comparing prices across shops. Approximate on
+# purpose: it only orders results, it is not a landed-cost quote.
+USD_PER = {"USD": 1, "EUR": 1.08, "GBP": 1.27, "CHF": 1.13, "CAD": 0.72, "AUD": 0.65,
+           "JPY": 0.0066, "HKD": 0.128, "SGD": 0.74, "KRW": 0.00072, "CNY": 0.138,
+           "SEK": 0.095, "DKK": 0.145, "NOK": 0.092}
+
+
+def _usd(price, currency, default="USD"):
+    if price is None:
+        return None
+    rate = USD_PER.get((currency or default).upper())
+    return price * rate if rate else None
+
+
+def reference_price(card, results):
+    """Retail in USD: from the card if known, else the median price found."""
+    ref = _usd(card.get("retail_price"), card.get("retail_currency"))
+    if ref:
+        return ref
+    found = sorted(p for p in (r["usd"] for r in results) if p)
+    return found[len(found) // 2] if found else None
+
+
+def rank(card, results):
+    """Match group first (exact, season, lineage, inspired), then best deal."""
+    default_cur = card.get("retail_currency") or "USD"
+    for r in results:
+        r["usd"] = _usd(r["price"], r.get("currency"), default_cur)
+    ref = reference_price(card, results)
+    for r in results:
+        r["discount"] = (1 - r["usd"] / ref) if ref and r["usd"] else None
+    return sorted(results, key=lambda r: (
+        LABEL_ORDER[r["label"]],
+        -(r["discount"] if r["discount"] is not None else -1e9)))  # unknown price last
+
+
 def run_search(item_id, card, strictness="lineage"):
     urls = discover(card)
     with ThreadPoolExecutor(6) as pool:
         out = [r for r in pool.map(lambda u: _process(item_id, card, strictness, u), urls) if r]
-    return sorted(out, key=lambda r: (LABEL_ORDER[r["label"]],
-                                      r["price"] if r["price"] is not None else 1e12))
+    return rank(card, out)
 
 
 def format_result(r, prefix=""):
     price = f"{r['price']:,.2f} {r.get('currency') or ''}".strip() if r["price"] else "price ?"
     tag = "Price drop: " if r["status"] == "cheaper" else prefix
+    d = r.get("discount")
+    if d is not None and d >= 0.05:
+        price += f"  ({d:.0%} below retail)"
+    elif d is not None and d <= -0.05:
+        price += f"  ({-d:.0%} above retail)"
     extra = []
     if r.get("condition"):
         extra.append(r["condition"])
