@@ -45,6 +45,37 @@ def ask_json(content, schema, max_tokens=4000, effort="low"):
     return json.loads(text)
 
 
+def web_search_urls(queries, max_continuations=3):
+    """Run search queries through Claude's built-in web search tool; return result URLs.
+
+    One request covers every query. Billed per search plus tokens, no extra key.
+    """
+    tools = [{"type": "web_search_20260209", "name": "web_search",
+              "max_uses": len(queries)}]
+    messages = [{"role": "user", "content":
+                 "Run a separate web search for each query below, exactly as written, "
+                 "one after another. Do not summarise; just run the searches.\n\n"
+                 + "\n".join(f"- {q}" for q in queries)}]
+    urls = []
+    try:
+        for _ in range(max_continuations + 1):
+            resp = client.messages.create(model=MODEL, max_tokens=4000, tools=tools,
+                                          output_config={"effort": "low"},
+                                          messages=messages)
+            for block in resp.content:
+                # success: content is a list of results; error: a single error object
+                if block.type == "web_search_tool_result" and isinstance(block.content, list):
+                    urls += [r.url for r in block.content if getattr(r, "url", None)]
+            if resp.stop_reason != "pause_turn":
+                break
+            messages = messages[:1] + [{"role": "assistant", "content": resp.content}]
+    except anthropic.APIStatusError as e:
+        raise LLMError(f"web search failed ({e.status_code}): {e.message}") from e
+    except anthropic.APIConnectionError as e:
+        raise LLMError(f"network error during web search: {e}") from e
+    return list(dict.fromkeys(urls))
+
+
 def _nullable(t):
     return {"type": [t, "null"]}
 

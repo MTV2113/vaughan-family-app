@@ -8,7 +8,7 @@ from urllib.parse import urlparse, urlunparse
 import httpx
 from bs4 import BeautifulSoup
 
-from llm import LLMError, ask_json
+from llm import LLMError, ask_json, web_search_urls
 from store import (get_neighbors, mark_seen, promote_domain, seen_status,
                    watched_domains)
 
@@ -67,12 +67,17 @@ def web_search(q):
 
 
 def discover(card):
-    if not BRAVE:
-        raise RuntimeError("BRAVE_API_KEY is not set")
-    urls = []
-    with ThreadPoolExecutor(4) as pool:
-        for batch in pool.map(_safe_search, build_queries(card)):
-            urls += batch
+    """Brave if BRAVE_API_KEY is set, otherwise Claude's built-in web search."""
+    queries = build_queries(card)
+    if not queries:
+        return []
+    if BRAVE:
+        urls = []
+        with ThreadPoolExecutor(4) as pool:
+            for batch in pool.map(_safe_search, queries):
+                urls += batch
+    else:
+        urls = web_search_urls(queries)
     urls = [u for u in dict.fromkeys(urls)
             if not any(s in urlparse(u).netloc for s in SKIP_DOMAINS)]
     return urls[:MAX_URLS]
