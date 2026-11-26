@@ -70,6 +70,9 @@ def web_search(q):
     return [x["url"] for x in r.json().get("web", {}).get("results", [])]
 
 
+# Shops you never want, comma-separated. Excluded from search itself, not just filtered after.
+EXCLUDED_SHOPS = {d.strip().lower().removeprefix("www.") for d in
+                  os.environ.get("STYLE_FINDER_EXCLUDE", "grailed.com").split(",") if d.strip()}
 EXTRA_ROUNDS = int(os.environ.get("STYLE_FINDER_EXTRA_ROUNDS", "2"))
 
 
@@ -102,7 +105,7 @@ def discover(card):
     queries = build_queries(card)
     if not queries:
         return []
-    skip = blocked_domains()
+    skip = blocked_domains() | EXCLUDED_SHOPS
     urls = _run_queries(queries, exclude=skip)
     core = [q for q in queries if "site:" not in q][:10]
     for _ in range(EXTRA_ROUNDS):
@@ -114,7 +117,8 @@ def discover(card):
     per_shop, out = {}, []
     for u in dict.fromkeys(urls):
         host = _host(u)
-        if host in skip or any(s in host for s in SKIP_DOMAINS):
+        if any(host == d or host.endswith("." + d) for d in skip) or \
+                any(s in host for s in SKIP_DOMAINS):
             continue
         per_shop[host] = per_shop.get(host, 0) + 1
         if per_shop[host] <= MAX_PER_SHOP:
