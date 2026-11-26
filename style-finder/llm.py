@@ -106,6 +106,7 @@ CARD_FIELDS = {
     "season": _nullable("string"),
     "price_tier": {"type": "string",
                    "enum": ["budget", "mid", "premium", "luxury", "unknown"]},
+    "official_url": _nullable("string"),
     "retail_price": _nullable("number"),
     "retail_currency": _nullable("string"),
     "notes": _nullable("string"),

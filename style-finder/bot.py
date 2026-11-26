@@ -15,6 +15,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,  # 
 
 from llm import CARD_SCHEMA, LLMError, ask_json  # noqa: E402
 from memory import learn_from_card, nightly_refine  # noqa: E402
+from official import enrich  # noqa: E402
 from search import STRICTNESS, format_result, run_search  # noqa: E402
 from store import (add_feedback, adjust_neighbor, all_items, block_domain,  # noqa: E402
                    get_item, get_result, items_for_chat, promote_domain, remove_item,
@@ -61,6 +62,7 @@ LABELS = [("brand", "Brand"), ("product_name", "Product"), ("aliases", "Aliases"
           ("style_code", "Style code"), ("category", "Category"),
           ("silhouette", "Silhouette"), ("color", "Color"), ("material", "Material"),
           ("season", "Season"), ("price_tier", "Price tier"), ("retail_price", "Retail"),
+          ("official_url", "Brand page"),
           ("notes", "Notes")]
 
 
@@ -115,6 +117,9 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if pending and not image_bytes:
             await msg.chat.send_action("typing")
             fixed = await asyncio.to_thread(apply_correction, pending, text)
+            if (fixed.get("brand"), fixed.get("product_name")) != \
+                    (pending.get("brand"), pending.get("product_name")):
+                fixed, _ = await asyncio.to_thread(enrich, fixed)  # product changed: re-check
             ctx.user_data["pending_card"] = fixed
             await msg.reply_text("Updated:\n\n" + format_card(fixed) + "\n\nReply 'ok' to search.")
             return
@@ -124,8 +129,13 @@ async def handle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         await msg.chat.send_action("typing")
         card = await asyncio.to_thread(extract_card, image_bytes, media_type, text)
+        await msg.reply_text("Got it. Checking the brand's own site for the product code…")
+        await msg.chat.send_action("typing")
+        card, found = await asyncio.to_thread(enrich, card)
         ctx.user_data["pending_card"] = card
-        await msg.reply_text("Here's what I see:\n\n" + format_card(card) +
+        note = ("" if found else "\n\n(I couldn't find this on the brand's own site, so the "
+                "style code is missing. If you know it, tell me.)")
+        await msg.reply_text("Here's what I see:\n\n" + format_card(card) + note +
                              "\n\nReply 'ok' to search, tell me what to fix, or /cancel.")
     except LLMError as e:
         await msg.reply_text(f"Sorry, that failed: {e}")
