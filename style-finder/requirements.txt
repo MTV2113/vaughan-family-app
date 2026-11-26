@@ -1,0 +1,5 @@
+anthropic>=2.14
+python-telegram-bot[job-queue]>=22
+python-dotenv
+httpx
+beautifulsoup4
