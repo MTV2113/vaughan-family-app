@@ -3,7 +3,7 @@ import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -305,6 +305,121 @@ def _claude_fetch(url):
     return d
 
 
+# Sites that list the same product from many shops. They are recognised by page type,
+# not used as a shop roster: any shop can still come from the open search.
+AGGREGATORS = ("lyst.", "modesens.", "stylight.", "shopstyle.", "editorialist.",
+               "fashiola.", "goxip.", "snapfashion.", "thelist.app")
+
+AGG_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "is_product_page": {"type": "boolean"},
+        "title": {"type": ["string", "null"]},
+        "brand": {"type": ["string", "null"]},
+        "sku": {"type": ["string", "null"]},
+        "offers": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "retailer": {"type": "string"},
+                "retailer_domain": {"type": ["string", "null"]},
+                "link": {"type": ["string", "null"]},
+                "price": {"type": ["number", "null"]},
+                "currency": {"type": ["string", "null"]},
+                "in_stock": {"type": ["boolean", "null"]},
+                "condition": {"type": ["string", "null"]},
+                "sizes": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["retailer", "retailer_domain", "link", "price", "currency",
+                         "in_stock", "condition", "sizes"],
+            "additionalProperties": False}},
+    },
+    "required": ["is_product_page", "title", "brand", "sku", "offers"],
+    "additionalProperties": False,
+}
+
+
+def is_aggregator(url):
+    host = urlparse(url).netloc.lower()
+    return any(a in host for a in AGGREGATORS)
+
+
+def _resolve(link, client):
+    """Follow an aggregator's click-out link to the shop's own URL (body not read)."""
+    try:
+        with client.stream("GET", link) as r:
+            return str(r.url)
+    except httpx.HTTPError:
+        return None
+
+
+AGG_PROMPT = ("This is a fashion price-comparison page. If it is for ONE specific product "
+              "sold by several shops, extract the product and every shop offer. For each offer "
+              "give the shop's name, its domain if you can tell, and the link that leads to "
+              "that shop's offer (null if none). Skip offers that are sold out. Otherwise "
+              "(category, search or editorial page, or the page can't be fetched) set "
+              "is_product_page to false.")
+
+
+def _agg_offers(url, d, client=None):
+    """Turn the model's reading of an aggregator page into one candidate per shop offer."""
+    if not d["is_product_page"] or not d["title"]:
+        return []
+    agg_host = urlparse(url).netloc.removeprefix("www.")
+    out = []
+    for o in d["offers"][:15]:
+        if o["in_stock"] is False:
+            continue
+        link = urljoin(url, o["link"]) if o["link"] else None
+        final = _resolve(link, client) if (link and client) else None
+        host = urlparse(final).netloc.removeprefix("www.") if final else ""
+        direct = bool(final) and agg_host.split(".")[0] not in host
+        out.append({
+            "title": d["title"], "brand": d["brand"], "sku": d["sku"], "image": None,
+            "price": parse_price(o["price"]), "currency": o["currency"],
+            "condition": o["condition"], "sizes": o["sizes"], "in_stock": o["in_stock"],
+            "url": final if direct else (link or url),
+            "domain": host if direct else (o["retailer_domain"] or o["retailer"]),
+            "via": agg_host})
+    return out
+
+
+def _agg_fetch(url):
+    """Aggregators that turn bots away: Claude fetches the page and reads the offers."""
+    d = ask_json([{"type": "text", "text": f"Fetch {url} with the web_fetch tool. " + AGG_PROMPT}],
+                 AGG_SCHEMA, max_tokens=4000,
+                 tools=[{"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 1}])
+    return _agg_offers(url, d)
+
+
+def extract_aggregator(url):
+    """One aggregator page -> one candidate per shop offer, tagged 'via <aggregator>'.
+
+    Lets shops that block bots (Farfetch, Mr Porter...) appear through the price and stock
+    the aggregator already shows, linking to the shop's own page.
+    """
+    try:
+        with httpx.Client(headers=HEADERS, timeout=15, follow_redirects=True) as c:
+            r = c.get(url)
+            if r.status_code in (401, 403, 429, 503):  # bot wall
+                return _agg_fetch(url)
+            if r.status_code >= 400 or "html" not in r.headers.get("content-type", ""):
+                return []
+            soup = BeautifulSoup(r.text, "html.parser")
+            links, seen = [], set()
+            for a in soup.find_all("a", href=True):
+                text = a.get_text(" ", strip=True)[:60]
+                href = urljoin(url, a["href"])
+                if text and href not in seen and href.startswith("http"):
+                    seen.add(href)
+                    links.append(f"{text} -> {href}")
+            text = soup.get_text(" ", strip=True)[:7000]
+            d = ask_json(AGG_PROMPT + " Use a link from the LINKS list.\n\nPAGE TEXT:\n" + text
+                         + "\n\nLINKS:\n" + "\n".join(links[:120]), AGG_SCHEMA, max_tokens=4000)
+            return _agg_offers(url, d, c)
+    except (httpx.HTTPError, LLMError, ValueError):
+        return []
+
+
 def extract_product(url):
     try:
         with httpx.Client(headers=HEADERS, timeout=15, follow_redirects=True) as c:
@@ -411,10 +526,17 @@ def _tier_ok(card, product):
 
 # --- Orchestration ----------------------------------------------------------
 
-def _process(item_id, card, strictness, url):
+def _candidates(url):
+    if is_aggregator(url):
+        return extract_aggregator(url)
     p = extract_product(url)
-    if not p or p.get("in_stock") is False:
+    return [p] if p else []
+
+
+def _judge(item_id, card, strictness, p):
+    if p.get("in_stock") is False:
         return None  # not marked seen: if it comes back in stock it shows up as new
+    url = p["url"]
     status = seen_status(item_id, url, p["price"])
     if status is None:
         return None
@@ -434,6 +556,10 @@ def _process(item_id, card, strictness, url):
         return None
     promote_domain(p["domain"])
     return {**p, "label": label, "reason": reason, "status": status}
+
+
+def _process(item_id, card, strictness, url):
+    return [r for r in (_judge(item_id, card, strictness, p) for p in _candidates(url)) if r]
 
 
 # Rough USD value of one unit, for comparing prices across shops. Approximate on
@@ -475,8 +601,15 @@ def rank(card, results):
 def run_search(item_id, card, strictness="lineage"):
     urls = discover(card)
     with ThreadPoolExecutor(10) as pool:
-        out = [r for r in pool.map(lambda u: _process(item_id, card, strictness, u), urls) if r]
-    return rank(card, out)
+        out = [r for batch in pool.map(lambda u: _process(item_id, card, strictness, u), urls)
+               for r in batch]
+    # the same shop page can arrive directly and via an aggregator: keep one
+    best = {}
+    for r in out:
+        k = r["url"]
+        if k not in best or (r["price"] or 1e12) < (best[k]["price"] or 1e12):
+            best[k] = r
+    return rank(card, list(best.values()))
 
 
 def format_result(r, prefix=""):
@@ -493,6 +626,7 @@ def format_result(r, prefix=""):
     if r.get("sizes"):
         extra.append("sizes: " + ", ".join(r["sizes"][:8]))
     lines = [f"{tag}[{r['label']}] {r['title']}",
-             f"{price}  |  {r['domain']}" + (f"  |  {'; '.join(extra)}" if extra else ""),
+             f"{price}  |  {r['domain']}" + (f" (via {r['via']})" if r.get("via") else "")
+             + (f"  |  {'; '.join(extra)}" if extra else ""),
              r["reason"], r["url"]]
     return "\n".join(lines)
