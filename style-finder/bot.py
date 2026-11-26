@@ -143,8 +143,11 @@ async def search_and_report(ctx, chat_id, item_id, card, strictness):
         await ctx.bot.send_message(chat_id, f"Nothing verified yet for #{item_id}. "
                                             "I'll keep watching.")
         return
-    for r in results[:8]:
+    await ctx.bot.send_message(chat_id, f"#{item_id}: {len(results)} match"
+                                        f"{'es' if len(results) != 1 else ''}, best deals first.")
+    for r in results:
         await send_result(ctx.bot, chat_id, item_id, r)
+        await asyncio.sleep(0.5)  # stay under Telegram's per-chat rate limit
 
 
 # --- results with 👍 / 👎 ----------------------------------------------------
@@ -226,8 +229,9 @@ async def recheck(ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             log.exception("recheck failed for item %s", item_id)
             continue
-        for r in results[:5]:
+        for r in results:
             await send_result(ctx.bot, chat_id, item_id, r, prefix=f"New for #{item_id}: ")
+            await asyncio.sleep(0.5)
 
 
 async def nightly(ctx: ContextTypes.DEFAULT_TYPE):

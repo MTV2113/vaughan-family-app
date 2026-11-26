@@ -16,12 +16,15 @@ BRAVE = os.environ.get("BRAVE_API_KEY")
 HEADERS = {"User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                           "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36"),
            "Accept-Language": "en-US,en;q=0.9"}
-RESALE = ["grailed.com", "vestiairecollective.com", "therealreal.com",
-          "farfetch.com", "ssense.com"]
 # Pages that are never a single listing; skip without fetching.
 SKIP_DOMAINS = ("instagram.com", "pinterest.", "reddit.com", "youtube.com",
                 "tiktok.com", "facebook.com", "x.com", "twitter.com", "wikipedia.org")
-MAX_URLS = int(os.environ.get("STYLE_FINDER_MAX_URLS", "40"))
+MAX_URLS = int(os.environ.get("STYLE_FINDER_MAX_URLS", "150"))
+MAX_PER_SHOP = int(os.environ.get("STYLE_FINDER_MAX_PER_SHOP", "4"))  # keeps one shop from crowding out the rest
+MAX_QUERIES = int(os.environ.get("STYLE_FINDER_MAX_QUERIES", "30"))
+# Phrasings that pull in different kinds of sellers: retail, sale, resale, deadstock.
+INTENTS = ["buy", "sale", "in stock", "pre-owned", "used", "resale", "deadstock",
+           "new with tags", "boutique", "store"]
 
 STRICTNESS = {
     "exact": {"EXACT"},
@@ -39,22 +42,23 @@ def _norm(s):
 # --- Step 2: discovery ------------------------------------------------------
 
 def build_queries(card):
+    """No fixed shop list: many phrasings so any shop that has it can surface."""
     brand = card.get("brand") or ""
     names = [card.get("product_name")] + (card.get("aliases") or [])
     qs = [f"{brand} {n}".strip() for n in names if n]
-    if card.get("style_code"):
-        qs.insert(0, f"{brand} {card['style_code']}".strip())
+    code = card.get("style_code")
+    if code:
+        qs[:0] = [f"{brand} {code}".strip(), code]  # a bare style code finds resale and overseas shops
     qs.append(" ".join(filter(None, [brand, card.get("color"),
                                      card.get("silhouette"), card.get("category")])))
     qs = [q for q in qs if q]
     if not qs:
         return []
-    # site: queries use the plainest name, not the style code
-    head = qs[1] if card.get("style_code") and len(qs) > 1 else qs[0]
-    # resale/aggregators and previously-matching domains are just more queries
-    for d in list(dict.fromkeys(watched_domains()[:5] + RESALE)):
-        qs.append(f"{head} site:{d}")
-    return list(dict.fromkeys(qs))[:14]
+    head = next((f"{brand} {n}".strip() for n in names if n), qs[0])
+    qs += [f"{head} {intent}" for intent in INTENTS]
+    # shops that matched before get a direct look, on top of the open search
+    qs += [f"{head} site:{d}" for d in watched_domains()[:10]]
+    return list(dict.fromkeys(qs))[:MAX_QUERIES]
 
 
 def web_search(q):
@@ -66,23 +70,63 @@ def web_search(q):
     return [x["url"] for x in r.json().get("web", {}).get("results", [])]
 
 
+EXTRA_ROUNDS = int(os.environ.get("STYLE_FINDER_EXTRA_ROUNDS", "2"))
+
+
+def _host(u):
+    return urlparse(u).netloc.removeprefix("www.")
+
+
+def _run_queries(queries, exclude=()):
+    if BRAVE:
+        suffix = "".join(f" -site:{d}" for d in list(exclude)[:20])
+        with ThreadPoolExecutor(4) as pool:
+            return [u for batch in pool.map(_safe_search, [q + suffix for q in queries])
+                    for u in batch]
+    batches = [queries[i:i + 8] for i in range(0, len(queries), 8)]
+    with ThreadPoolExecutor(len(batches)) as pool:
+        results = list(pool.map(lambda b: _safe_claude_search(b, exclude), batches))
+    errors = [r for r in results if isinstance(r, LLMError)]
+    if len(errors) == len(results):
+        raise errors[0]  # every batch failed (e.g. out of credit): say so, don't report "nothing found"
+    return [u for r in results if not isinstance(r, LLMError) for u in r]
+
+
 def discover(card):
-    """Brave if BRAVE_API_KEY is set, otherwise Claude's built-in web search."""
+    """Open-web discovery with no shop list.
+
+    Round 1 runs every query. Search engines keep returning the same few big sites
+    (often the brand's own), so each extra round re-runs the core queries with every
+    shop found so far excluded, which forces new shops to surface.
+    """
     queries = build_queries(card)
     if not queries:
         return []
-    if BRAVE:
-        urls = []
-        with ThreadPoolExecutor(4) as pool:
-            for batch in pool.map(_safe_search, queries):
-                urls += batch
-    else:
-        urls = web_search_urls(queries)
-    blocked = blocked_domains()
-    urls = [u for u in dict.fromkeys(urls)
-            if not any(s in urlparse(u).netloc for s in SKIP_DOMAINS)
-            and urlparse(u).netloc.removeprefix("www.") not in blocked]
-    return urls[:MAX_URLS]
+    skip = blocked_domains()
+    urls = _run_queries(queries, exclude=skip)
+    core = [q for q in queries if "site:" not in q][:10]
+    for _ in range(EXTRA_ROUNDS):
+        found = {_host(u) for u in urls}
+        more = [u for u in _run_queries(core, exclude=found | skip) if _host(u) not in found]
+        if not more:
+            break
+        urls += more
+    per_shop, out = {}, []
+    for u in dict.fromkeys(urls):
+        host = _host(u)
+        if host in skip or any(s in host for s in SKIP_DOMAINS):
+            continue
+        per_shop[host] = per_shop.get(host, 0) + 1
+        if per_shop[host] <= MAX_PER_SHOP:
+            out.append(u)
+    return out[:MAX_URLS]
+
+
+def _safe_claude_search(batch, exclude=()):
+    try:
+        return web_search_urls(batch, blocked_domains=exclude)
+    except LLMError as e:
+        return e
 
 
 def _safe_search(q):
@@ -240,12 +284,32 @@ def _llm_page(soup):
     return d
 
 
+def _claude_fetch(url):
+    """Shops that block automated visitors: Claude fetches and reads the page instead."""
+    d = ask_json([{"type": "text", "text":
+        f"Fetch {url} with the web_fetch tool. Does it sell one specific product (a product "
+        "listing, not a category, search or editorial page)? If so extract its fields; "
+        "condition is new, used, or deadstock if stated; sizes are only sizes in stock. "
+        "in_stock is false if it is sold out or only offers a restock notification in every "
+        "size; true if it can be bought now; null if unclear. If the page can't be fetched, "
+        "set is_single_product to false."}],
+        PAGE_SCHEMA, max_tokens=4000,
+        tools=[{"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 1}])
+    if not d.pop("is_single_product") or not d.get("title"):
+        return None
+    d["image"] = None
+    return d
+
+
 def extract_product(url):
     try:
         with httpx.Client(headers=HEADERS, timeout=15, follow_redirects=True) as c:
             p = _shopify(url, c)
             if not p:
                 r = c.get(url)
+                if r.status_code in (401, 403, 429, 503):  # bot wall
+                    p = _claude_fetch(url)
+                    return _finish(p, url)
                 if r.status_code >= 400 or "html" not in r.headers.get("content-type", ""):
                     return None
                 soup = BeautifulSoup(r.text, "html.parser")
@@ -256,6 +320,10 @@ def extract_product(url):
                     p["in_stock"] = _stock([meta.get("content")]) if meta else None
     except (httpx.HTTPError, LLMError, ValueError):
         return None
+    return _finish(p, url)
+
+
+def _finish(p, url):
     if not p or not p.get("title"):
         return None
     p["url"] = url
@@ -402,7 +470,7 @@ def rank(card, results):
 
 def run_search(item_id, card, strictness="lineage"):
     urls = discover(card)
-    with ThreadPoolExecutor(6) as pool:
+    with ThreadPoolExecutor(10) as pool:
         out = [r for r in pool.map(lambda u: _process(item_id, card, strictness, u), urls) if r]
     return rank(card, out)
 
