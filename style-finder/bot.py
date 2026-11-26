@@ -9,15 +9,16 @@ from dotenv import load_dotenv
 
 load_dotenv()  # before importing modules that read env at import time
 
-from telegram import Update  # noqa: E402
-from telegram.ext import (Application, CommandHandler, ContextTypes,  # noqa: E402
-                          MessageHandler, filters)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update  # noqa: E402
+from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,  # noqa: E402
+                          ContextTypes, MessageHandler, filters)
 
 from llm import CARD_SCHEMA, LLMError, ask_json  # noqa: E402
 from memory import learn_from_card, nightly_refine  # noqa: E402
 from search import STRICTNESS, format_result, run_search  # noqa: E402
-from store import (all_items, items_for_chat, remove_item, save_item,  # noqa: E402
-                   set_strictness)
+from store import (add_feedback, adjust_neighbor, all_items, block_domain,  # noqa: E402
+                   get_item, get_result, items_for_chat, promote_domain, remove_item,
+                   save_item, save_result, set_strictness)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -143,7 +144,79 @@ async def search_and_report(ctx, chat_id, item_id, card, strictness):
                                             "I'll keep watching.")
         return
     for r in results[:8]:
-        await ctx.bot.send_message(chat_id, format_result(r), disable_web_page_preview=False)
+        await send_result(ctx.bot, chat_id, item_id, r)
+
+
+# --- results with 👍 / 👎 ----------------------------------------------------
+
+# 👎 reasons: code -> (button text, what the bot learns)
+REASONS = {
+    "item": "Wrong item",
+    "brand": "Not this brand",
+    "style": "Not my style",
+    "cond": "Condition",
+    "price": "Too pricey",
+    "shop": "Don't trust shop",
+}
+
+
+def vote_buttons(rid):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("👍", callback_data=f"v:{rid}:u"),
+                                  InlineKeyboardButton("👎", callback_data=f"v:{rid}:d")]])
+
+
+def reason_buttons(rid):
+    codes = list(REASONS)
+    rows = [[InlineKeyboardButton(REASONS[c], callback_data=f"r:{rid}:{c}") for c in codes[i:i + 2]]
+            for i in range(0, len(codes), 2)]
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_result(bot, chat_id, item_id, r, prefix=""):
+    rid = save_result(item_id, r)
+    await bot.send_message(chat_id, format_result(r, prefix=prefix), reply_markup=vote_buttons(rid))
+
+
+def learn_from_vote(result, vote, reason):
+    """Turn a vote into lasting changes. Every vote also feeds future verify prompts."""
+    item = get_item(result["item_id"])
+    ref_brand = item[2].get("brand") if item else None
+    add_feedback(result["item_id"], result["id"], vote, reason and REASONS[reason])
+    if vote > 0:
+        promote_domain(result["domain"])
+        adjust_neighbor(ref_brand, result["brand"], +0.2)  # liked another brand: pull it closer
+    elif reason == "brand":
+        adjust_neighbor(ref_brand, result["brand"], -0.3)  # below 0.5 drops out of lineage
+    elif reason == "shop":
+        block_domain(result["domain"])
+
+
+async def on_vote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not allowed(update):
+        await q.answer()
+        return
+    kind, rid, val = q.data.split(":")
+    result = get_result(int(rid))
+    if not result:
+        await q.answer("That result is too old to rate.")
+        return
+    if kind == "v" and val == "u":
+        await asyncio.to_thread(learn_from_vote, result, 1, None)
+        await q.answer("Noted, more like this.")
+        await q.edit_message_reply_markup(InlineKeyboardMarkup(
+            [[InlineKeyboardButton("👍 Liked", callback_data=f"v:{rid}:d")]]))
+    elif kind == "v":
+        await asyncio.to_thread(learn_from_vote, result, -1, None)
+        await q.answer("What's off?")
+        await q.edit_message_reply_markup(reason_buttons(rid))
+    elif kind == "r" and val in REASONS:
+        await asyncio.to_thread(learn_from_vote, result, -1, val)
+        extra = {"shop": " I won't show this shop again.",
+                 "brand": " I'll show less of this brand."}.get(val, "")
+        await q.answer("Got it." + extra)
+        await q.edit_message_reply_markup(InlineKeyboardMarkup(
+            [[InlineKeyboardButton(f"👎 {REASONS[val]}", callback_data=f"v:{rid}:u")]]))
 
 
 async def recheck(ctx: ContextTypes.DEFAULT_TYPE):
@@ -154,7 +227,7 @@ async def recheck(ctx: ContextTypes.DEFAULT_TYPE):
             log.exception("recheck failed for item %s", item_id)
             continue
         for r in results[:5]:
-            await ctx.bot.send_message(chat_id, format_result(r, prefix=f"New for #{item_id}: "))
+            await send_result(ctx.bot, chat_id, item_id, r, prefix=f"New for #{item_id}: ")
 
 
 async def nightly(ctx: ContextTypes.DEFAULT_TYPE):
@@ -231,6 +304,7 @@ def main():
     app.add_handler(CommandHandler("remove", cmd_remove))
     app.add_handler(CommandHandler("check", cmd_check))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CallbackQueryHandler(on_vote, pattern=r"^[vr]:"))
     app.add_handler(MessageHandler(
         filters.PHOTO | filters.Document.IMAGE | (filters.TEXT & ~filters.COMMAND), handle))
     app.job_queue.run_repeating(recheck, interval=RECHECK_HOURS * 3600, first=300)

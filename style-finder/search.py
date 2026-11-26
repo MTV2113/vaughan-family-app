@@ -9,8 +9,8 @@ import httpx
 from bs4 import BeautifulSoup
 
 from llm import LLMError, ask_json, web_search_urls
-from store import (get_neighbors, mark_seen, promote_domain, seen_status,
-                   watched_domains)
+from store import (blocked_domains, feedback_examples, get_neighbors, mark_seen,
+                   promote_domain, seen_status, watched_domains)
 
 BRAVE = os.environ.get("BRAVE_API_KEY")
 HEADERS = {"User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -78,8 +78,10 @@ def discover(card):
                 urls += batch
     else:
         urls = web_search_urls(queries)
+    blocked = blocked_domains()
     urls = [u for u in dict.fromkeys(urls)
-            if not any(s in urlparse(u).netloc for s in SKIP_DOMAINS)]
+            if not any(s in urlparse(u).netloc for s in SKIP_DOMAINS)
+            and urlparse(u).netloc.removeprefix("www.") not in blocked]
     return urls[:MAX_URLS]
 
 
@@ -295,7 +297,17 @@ VERIFY_SCHEMA = {
 }
 
 
-def verify(card, product):
+def _feedback_text(item_id):
+    ex = feedback_examples(item_id) if item_id is not None else []
+    if not ex:
+        return ""
+    return ("\n\nThe user has voted on earlier results (👍 up / 👎 down, with their reason "
+            "when given). Treat these as their taste: reject candidates like the downvoted "
+            "ones for the same reason, and favour ones like the upvoted ones. Votes marked "
+            "for_this_item apply most strongly.\n" + json.dumps(ex))
+
+
+def verify(card, product, item_id=None):
     ref = {k: v for k, v in card.items() if not k.startswith("_")}
     near = [b for b, _ in get_neighbors(card.get("brand"))]
     d = ask_json(
@@ -310,7 +322,7 @@ def verify(card, product):
         "INSPIRED: similar silhouette and price tier from another serious designer.\n"
         "NO: anything else, including a much cheaper lookalike, a different category, or "
         "a page that is not really a listing for one item.\n"
-        "Give a one-sentence reason.",
+        "Give a one-sentence reason." + _feedback_text(item_id),
         VERIFY_SCHEMA, max_tokens=2000)
     return d["label"], d["reason"]
 
@@ -342,7 +354,7 @@ def _process(item_id, card, strictness, url):
         label, reason = "EXACT", "style code match"
     else:
         try:
-            label, reason = verify(card, p)
+            label, reason = verify(card, p, item_id)
         except LLMError:
             return None  # not marked seen, so it gets retried next run
     mark_seen(item_id, url, p["price"], label)
